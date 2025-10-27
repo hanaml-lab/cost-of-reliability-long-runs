@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "belay"
+version = "0.1.0"
+description = "BELAY: budget-optimal placement of verifiers, rollback points and retries in long-horizon agent runs"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+authors = [{name = "Manav Agarwal", email = "manav@hanaml.com"}]
+requires-python = ">=3.11"
+dependencies = ["numpy>=1.24", "scipy>=1.10"]
+
+[project.optional-dependencies]
+paper = ["matplotlib>=3.7"]
+dev = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
