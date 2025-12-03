@@ -30,7 +30,7 @@ class World:
     frailty: str = "gamma"  # or "lognormal"
     frailty_var: float | None = None  # defaults to model.frailty_var
     drift: float = 0.0  # the last step's hazard is (1 + drift) times the first's, linearly in between
-    blind_spot: tuple[float, ...] | None = None  # per check: recall scales with Z ** -blind_spot
+    blind_spot: tuple[float, ...] | None = None  # per check: on tasks harder than average (Z > 1) recall scales with Z ** -blind_spot
     vote_corr: float = 0.0  # probability that the votes on a step share one outcome
 
     def sample_z(self, rng: np.random.Generator, size: int) -> np.ndarray:
@@ -183,7 +183,7 @@ def simulate(job: Job, world: World, policy: Policy, runs: int, rng: np.random.G
         ec = np.clip(e, 1, n)
         lat = np.maximum(b - ec, 0)
         rec = rinf[vc] - (rinf[vc] - r0[vc]) * np.power(phi[vc], lat)
-        p_err = cov[vc, ec - 1] * rec * np.power(z[act], -blind[vc]) if V else np.zeros(len(act))
+        p_err = cov[vc, ec - 1] * rec * np.minimum(1.0, np.power(z[act], -blind[vc])) if V else np.zeros(len(act))
         p_flag = np.where(has_err, np.clip(p_err, 0, 1), fflag[vc])
         flag = checked & (rng.random(len(act)) < p_flag)
         nflags[act] += flag

@@ -22,6 +22,7 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 from scipy import optimize
+from scipy.special import expit
 
 from .model import Job, RunModel, frailty_nodes
 from .simulate import World
@@ -41,18 +42,20 @@ class Traces:
     retry_ok: np.ndarray
 
 
-def shadow_traces(jobs: list[Job], world: World, runs_per_job: int, rng: np.random.Generator) -> Traces:
+def shadow_traces(jobs: list[Job], world: World, runs_per_job: int, rng: np.random.Generator, z: np.ndarray | None = None) -> Traces:
     """Labelled development traces of ``runs_per_job`` runs of each job in ``world``.
 
-    A job is one task: its runs share the task's frailty draw.
+    A job is one task: its runs share the task's frailty, drawn from the world unless ``z`` gives one
+    value per job.
     """
     m = world.model
     cols = {k: [] for k in ("run_job", "first_error", "obs_run", "obs_check", "obs_type", "obs_latency", "obs_flag", "retry_run", "retry_mode", "retry_ok")}
     blind = np.zeros(len(m.checks)) if world.blind_spot is None else np.asarray(world.blind_spot, float)
+    z_tasks = z
     base = 0
     for j, job in enumerate(jobs):
         R, n = runs_per_job, job.n
-        z = np.full(R, world.sample_z(rng, 1)[0])
+        z = np.full(R, world.sample_z(rng, 1)[0] if z_tasks is None else z_tasks[j])
         eta = world.eta(job)
         H = np.concatenate([[0.0], np.cumsum(eta)])
         T = np.searchsorted(H, rng.exponential(size=R) / z, side="left")
@@ -71,7 +74,7 @@ def shadow_traces(jobs: list[Job], world: World, runs_per_job: int, rng: np.rand
             et = np.where(on, -1, job.types[np.maximum(tt, 1) - 1])
             lat = np.where(on, -1, bb - tt)
             cov = np.array([chk.covers(k) for k in range(len(m.hazard))])
-            p_err = cov[np.maximum(et, 0)] * chk.recall(np.maximum(lat, 0)) * np.power(z[rr], -blind[v])
+            p_err = cov[np.maximum(et, 0)] * chk.recall(np.maximum(lat, 0)) * np.minimum(1.0, np.power(z[rr], -blind[v]))
             p = np.where(on, chk.false_flag, np.clip(p_err, 0, 1))
             cols["obs_run"].append(runs[rr])
             cols["obs_check"].append(np.full(len(rr), v))
@@ -150,9 +153,9 @@ def _fit_check(chk, tr: Traces, v: int, n_types: int, latency: bool):
     seen = np.bincount(k, minlength=n_types) > 0
 
     def unpack(theta):
-        a = 1 / (1 + np.exp(-theta[:n_types]))
+        a = expit(theta[:n_types])
         rho = np.exp(theta[n_types]) if latency else 1.0
-        phi = 1 / (1 + np.exp(-theta[n_types + 1])) if latency else 0.5
+        phi = expit(theta[n_types + 1]) if latency else 0.5
         return a, rho, phi
 
     def nll(theta):

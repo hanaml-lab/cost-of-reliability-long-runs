@@ -13,7 +13,7 @@ from __future__ import annotations
 import numpy as np
 
 from .model import Job, RunModel, frailty_nodes
-from .placement import Plan, solve
+from .placement import Plan, _dp, local_price, segment_tables, solve
 
 
 def posterior_mean(frailty_var: float, exposure: float, detections: int, q: int = 64) -> float:
@@ -24,6 +24,15 @@ def posterior_mean(frailty_var: float, exposure: float, detections: int, q: int 
     return float((p * z).sum() / p.sum())
 
 
-def adaptive_plans(job: Job, model: RunModel, lam: float, max_detections: int = 3, **kwargs) -> list[Plan]:
-    """One plan per flag count 0..max_detections; a run with more flags uses the last."""
-    return [solve(job, model, lam, detections=d, **kwargs) for d in range(max_detections + 1)]
+def adaptive_plans(job: Job, model: RunModel, lam: float, max_detections: int = 3, linear: bool = False, **kwargs) -> list[Plan]:
+    """One plan per flag count 0..max_detections; a run with more flags uses the last.
+
+    With ``linear=True`` ``lam`` is the price lam0 of the linear objective; the job's local price is set
+    once, from the unflagged plan (``placement.local_price``), so a flag changes the plan only through the
+    frailty posterior.
+    """
+    if not linear:
+        return [solve(job, model, lam, detections=d, **kwargs) for d in range(max_detections + 1)]
+    tables = [segment_tables(job, model, detections=d, **kwargs) for d in range(max_detections + 1)]
+    price = local_price(job, tables[0], lam)
+    return [_dp(job, t, price) for t in tables]

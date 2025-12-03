@@ -61,3 +61,14 @@ def test_a_higher_price_on_tokens_buys_less_checking():
     costs = [solve(job, model, lam, q=6).cost for lam in (0.0005, 0.005, 0.05, 0.5)]
     assert costs == sorted(costs, reverse=True)
     assert solve(job, model, 5.0, q=6).checks == []
+
+
+def test_on_the_linear_objective_a_job_likely_to_fail_buys_less_checking():
+    # The local price is lam0 / (C0 * S*): below S* = 1 it is higher than the log program's lam0 / C0.
+    from belay.placement import solve_linear
+    hard = RunModel(hazard=(0.15, 0.4), checks=(CRITIC, RULE), frailty_var=0.7)
+    job = small_job()
+    c0 = job.costs.sum()
+    for lam0 in (0.1, 1.0):
+        assert solve_linear(job, hard, lam0, q=6).cost <= solve(job, hard, lam0 / c0, q=6).cost
+    assert solve_linear(job, hard, 1.0, q=6).cost < solve(job, hard, 1.0 / c0, q=6).cost
