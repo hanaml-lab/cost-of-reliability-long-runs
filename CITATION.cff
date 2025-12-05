@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the report below."
+title: "belay: budget-optimal placement of verifiers and rollbacks for long-horizon agents"
+version: 0.1.0
+date-released: 2025-12-09
+license: Apache-2.0
+repository-code: "https://github.com/hanaml-lab/cost-of-reliability-long-runs"
+authors:
+  - family-names: Agarwal
+    given-names: Manav
+    affiliation: hanaML
+preferred-citation:
+  type: report
+  title: "Where to Check: Budget-Optimal Placement of Verifiers and Rollbacks for Long-Horizon Agents"
+  authors:
+    - family-names: Agarwal
+      given-names: Manav
+  institution:
+    name: hanaML
+  year: 2025
+  url: "https://hanaml.com/research/papers/cost-of-reliability-long-runs"

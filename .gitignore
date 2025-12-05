@@ -4,3 +4,5 @@ __pycache__/
 paper/results.json
 paper/tables/
 paper/figures/
+paper/numbers.json
+paper/site.json
