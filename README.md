@@ -1,6 +1,8 @@
-# belay: budget-optimal placement of verifiers and rollbacks
+# BELAY: budget-optimal placement of verifiers and rollbacks
 
-Reference implementation for **"Where to Check: Budget-Optimal Placement of Verifiers and Rollbacks for Long-Horizon Agents"** (hanaML technical report, December 2025).
+[![ci](https://github.com/hanaml-lab/cost-of-reliability-long-runs/actions/workflows/ci.yml/badge.svg)](https://github.com/hanaml-lab/cost-of-reliability-long-runs/actions/workflows/ci.yml)
+
+Reference implementation of *Where to Check: Budget-Optimal Placement of Verifiers and Rollbacks for Long-Horizon Agents* (Agarwal, hanaML technical report, 2025).
 
 A long agent run fails by compounding, and the usual remedies (critics, retries, voting, re-planning) cost tokens wherever they run. BELAY decides where to spend them. It models a run as a hidden derailment process and solves for the plan that maximises expected success minus a price on tokens:
 
@@ -15,28 +17,55 @@ A long agent run fails by compounding, and the usual remedies (critics, retries,
 ## Install
 
 ```bash
-pip install -e ".[dev]"      # numpy, scipy, pytest
+pip install -e ".[dev]"      # numpy, scipy, pyyaml; pytest and ruff
 pip install -e ".[paper]"    # + matplotlib, to regenerate the report's tables and figures
 ```
 
-## Quickstart (CPU, under ten seconds)
+## Quickstart (CPU, under 20 seconds)
 
 ```bash
-python scripts/run_toy.py    # fit on shadow traces, plan, and compare policies on 50 held-out toy jobs
-pytest -q                    # 36 tests, including the program against exhaustive enumeration
+python -m belay.demo         # or belay-demo; settings in configs/toy.yaml
+pytest -q                    # includes the program against exhaustive enumeration
+```
+
+## Toy run (real output)
+
+The toy has 100 jobs of 20-40 steps with three step types (a reliable read, a risky decision and an irreversible write) and two checks (a near-free rule check and a same-model critic). Its ground truth has task frailty, an upward hazard drift and a critic blind on hard tasks, effects the planner's model partly omits. The planner fits its model on shadow-mode traces of half the jobs and every policy is simulated on the other half. Output of `python -m belay.demo` on a CPU (Python 3.12):
+
+```
+50 held-out toy jobs, 24 simulated runs each; price 0.02 per run of tokens
+policy                           success   tokens
+no checks                          0.470    1.00x
+critic after every step            0.612    2.06x
+critic every 4 steps               0.532    1.34x
+independent-step program           0.580    1.47x
+BELAY                              0.639    1.39x
+BELAY, re-planning after flags     0.644    1.39x
+done in 7.7s
+```
+
+Of the static policies, BELAY's plan succeeds most often, at two-thirds of the tokens of a critic after every step. The independent-step program, the same program on a fit without frailty, latency-dependent recall or retry modes, spends more for less. `paper/toy_run.md` records the environment and what each line shows.
+
+## Planning your own job
+
+`examples/plan_job.py` reads a job described in YAML (its step types and sequence, irreversible steps, per-type hazards, retry multipliers, and the checks available with their cost, recall and false-flag rate; `belay.fit` estimates these from shadow-mode traces) and prints the plan at several prices.
+
+```bash
+python examples/plan_job.py examples/data/ap_job.yaml
 ```
 
 ```
-policy         success   tokens
-none             0.470    1.00x
-every            0.612    2.06x
-periodic         0.532    1.34x
-indep            0.580    1.47x
-belay            0.639    1.39x
-belay+replan     0.644    1.39x
+job: 30 steps (12 read, 6 match, 6 decide, 6 pay; 6 irreversible), checks: totals, critic
+ price  success  tokens  checks placed
+  0.01    0.846   1.61x  critic x18, totals x12
+  0.05    0.843   1.43x  critic x12, totals x12
+  0.20    0.807   1.04x  totals x12
+no checks (simulated under the same model): success 0.639 at 1.00x tokens
+critic after every step (simulated under the same model): success 0.781 at 2.02x tokens
+first checks at price 0.2: totals after step 3, totals after step 5, totals after step 8, totals after step 10, totals after step 13, totals after step 15, ...
 ```
 
-### Planning your own job
+The same from Python:
 
 ```python
 import numpy as np
@@ -53,7 +82,7 @@ print(plan.checks, plan.success, plan.cost)     # [(position, check index), ...]
 
 ## Results (from the report)
 
-Qwen3-32B agent; success (%) and tokens relative to a single run at the default price λ₀ = 0.2, mean over five seeds.
+These numbers come from the report's seeded simulation and are illustrative. Qwen3-32B agent; success (%) and tokens relative to a single run at the default price λ₀ = 0.2, mean over five seeds.
 
 | Policy | τ-bench retail | Tokens | Back-office | Tokens |
 |---|---|---|---|---|
@@ -65,21 +94,22 @@ Qwen3-32B agent; success (%) and tokens relative to a single run at the default 
 
 Model prediction on held-out policies: mean absolute error 0.8 points (independent-step fit: 4.5); pass^4 1.0 (independent-step fit: 16.4). Durable journal with idempotency keys: 97% of successful jobs survive an injected crash, against 38% for restarting an in-memory loop.
 
-The report's numbers come from a seeded simulation study calibrated to public baselines (see its Limitations section). `scripts/reproduce_paper.sh` regenerates every table and figure from `paper/make_data.py` and `paper/figures.py`.
+`bash scripts/reproduce_paper.sh` regenerates every table and figure (about ten minutes on 16 cores; `WORKERS` sets the number of processes). The report's tables were generated with SciPy linked against Intel MKL. This simulation fits its models with SciPy's optimisers, so it is sensitive to the BLAS build: with the PyPI wheels (OpenBLAS) the regenerated tables differ from the report's by at most 1.2 points, and by 0.1 on the headline row (for example BELAY on τ-bench retail, 63.5 instead of 63.6). A figure derived from them moves further: at the success of a critic after every step, BELAY saves 55% of the extra tokens rather than the report's 65%. CI regenerates the tables in a pinned environment (numpy 2.3.5, SciPy 1.16.3, one OpenBLAS kernel and thread) and checks them against `paper/results.sha256`, which records that environment's output; `python paper/check_results.py` runs the same check.
 
 ## Layout
 
 ```
-src/belay/      model.py  placement.py  adaptive.py  fit.py  simulate.py  theory.py  journal.py  toy.py
-configs/        toy.toml  tau_bench.toml  theagentcompany.toml  backoffice.toml
+src/belay/      model.py  placement.py  adaptive.py  fit.py  simulate.py  theory.py  journal.py  toy.py  demo.py
+configs/        toy.yaml  tau_bench.yaml  theagentcompany.yaml  backoffice.yaml
+examples/       plan_job.py, data/ap_job.yaml
 scripts/        run_toy.py  reproduce_paper.sh
-paper/          make_data.py  figures.py
+paper/          make_data.py  figures.py  check_results.py  results.sha256  toy_run.md
 tests/          pytest suite
 ```
 
 ## Full-scale runs
 
-The configs record the paper's settings: a Qwen3-32B ReAct agent on τ-bench (retail and airline), TheAgentCompany and the back-office jobs, with each environment's deterministic checks and a same-model critic. This repository holds the model, the placement program, fitting and simulation; it does not include agent scaffolds, benchmark harnesses or model weights.
+The configs record the report's settings: a Qwen3-32B ReAct agent on τ-bench (retail and airline), TheAgentCompany and the back-office jobs, with each environment's deterministic checks and a same-model critic. This repository holds the model, the placement program, fitting and simulation; it does not include agent scaffolds, benchmark harnesses or model weights.
 
 ## Citation
 
@@ -94,6 +124,6 @@ The configs record the paper's settings: a Qwen3-32B ReAct agent on τ-bench (re
 }
 ```
 
-## Licence
+## License
 
-Apache-2.0.
+Apache-2.0. See `LICENSE`.
