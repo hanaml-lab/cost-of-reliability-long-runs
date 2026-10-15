@@ -36,10 +36,11 @@ def toy_jobs(count: int = 100, seed: int = 0) -> list[Job]:
     return jobs
 
 
-def run_toy(seed: int = 0, lam0: float = 0.02, trials: int = 24) -> dict:
+def run_toy(seed: int = 0, lam0: float = 0.02, trials: int = 24, jobs: int = 100) -> dict:
+    """Fit on shadow traces of half the jobs, plan, and simulate every policy on the other half."""
     rng = np.random.default_rng(seed)
     world = World(TRUTH, frailty="gamma", drift=0.25, blind_spot=(0.0, 0.35))
-    jobs = toy_jobs(seed=seed)
+    jobs = toy_jobs(jobs, seed=seed)
     z = world.sample_z(rng, len(jobs))
     dev, test = np.arange(0, len(jobs), 2), np.arange(1, len(jobs), 2)
     traces = shadow_traces([jobs[i] for i in dev], world, 8, rng, z=z[dev])

@@ -1,0 +1,8 @@
+# CPU toy setting for python -m belay.demo (src/belay/toy.py): runs in seconds.
+# Jobs of 20-40 steps (a reliable read, a risky decision, an irreversible write) with a near-free rule check and a
+# same-model critic. The ground truth has gamma task frailty, an upward hazard drift and a critic blind on hard
+# tasks; the planner fits its model on shadow-mode traces of half the jobs and is evaluated on the other half.
+seed: 0
+jobs: 100
+trials: 24      # simulated runs per held-out job and policy
+price: 0.02     # lam0: success given up per unchecked run of tokens

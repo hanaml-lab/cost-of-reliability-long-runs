@@ -1,0 +1,21 @@
+# 200 synthetic back-office jobs (accounts payable), 18-140 steps, as in the report.
+agent:
+  model: "Qwen/Qwen3-32B"
+  mode: "thinking"
+  loop: "react"
+  trials_per_task: 4
+
+checks:
+  record_exists: { kind: "deterministic", after: ["read"] }
+  totals: { kind: "deterministic", after: ["match", "pay"], placement: "pre-commit" }
+  critic: { kind: "same-model", model: "Qwen/Qwen3-32B" }
+
+durability:
+  journal: "postgresql"
+  idempotency_keys: true
+  crash: "one per job, uniform in wall-clock time"
+
+plan:
+  default_price: 0.03
+  max_retries: 2
+  flag_cap: 3

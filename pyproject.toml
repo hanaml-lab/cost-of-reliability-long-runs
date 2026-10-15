@@ -10,11 +10,14 @@ readme = "README.md"
 license = {text = "Apache-2.0"}
 authors = [{name = "Manav Agarwal", email = "manav@hanaml.com"}]
 requires-python = ">=3.11"
-dependencies = ["numpy>=1.24", "scipy>=1.10"]
+dependencies = ["numpy>=1.24", "scipy>=1.10", "pyyaml>=6.0"]
 
 [project.optional-dependencies]
 paper = ["matplotlib>=3.7"]
 dev = ["pytest>=7"]
+
+[project.scripts]
+belay-demo = "belay.demo:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
