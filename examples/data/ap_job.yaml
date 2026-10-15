@@ -1,0 +1,27 @@
+# A month-end accounts-payable job: read an invoice and its purchase order, match them, decide, and pay.
+# Payments are irreversible (marked !). The rates below are illustrative; belay.fit estimates them from
+# shadow-mode traces of your own agent.
+step_types: [read, match, decide, pay]
+steps: >-
+  read read match decide pay!
+  read read match decide pay!
+  read read match decide pay!
+  read read match decide pay!
+  read read match decide pay!
+  read read match decide pay!
+hazard: {read: 0.004, match: 0.03, decide: 0.05, pay: 0.02}    # per-step derailment probability
+run: {frailty_var: 1.5, retry_fresh: 0.9, retry_inplace: 1.6}   # task frailty and retry multipliers
+checks:
+  - name: totals            # a deterministic check that the amounts reconcile, nearly free
+    cost: 0.0
+    fixed_cost: 0.03
+    recall0: 0.97
+    false_flag: 0.005
+    coverage: {read: 0.0, match: 0.8, decide: 0.5, pay: 0.6}
+    after: [match, pay]
+  - name: critic            # a same-model critic that reads the context of the step it follows
+    cost: 0.8
+    recall0: 0.62
+    recall_inf: 0.27
+    decay: 0.55
+    false_flag: 0.07
