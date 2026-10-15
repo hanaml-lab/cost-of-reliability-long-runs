@@ -9,6 +9,12 @@ Tables, text and figures therefore agree by construction.
 
 Requires the ``belay`` package (pip install -e .. from the repository root, or BELAY_SRC=<repo>/src).
 Runs in about ten minutes on 16 CPU cores.
+
+Two additions draw on their own random streams, so every number above them is drawn exactly as before:
+the hazard-drift ablation (plans from a fit with one more parameter, kappa, simulated on the stream
+[MASTER, 71, ...]) and the statistical reporting (bootstrap intervals over tasks and paired tests,
+[MASTER, 81]). ``--update`` recomputes the benchmarks, the horizon study and the placement map and
+keeps the transfer and durability studies from results.json.
 """
 from __future__ import annotations
 
@@ -16,18 +22,18 @@ import json
 import math
 import os
 import sys
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from multiprocessing import Pool
 
 import numpy as np
-from scipy import stats
+from scipy import optimize, stats
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.environ.get("BELAY_SRC", os.path.join(ROOT, "..", "src")))
 
 from belay.adaptive import posterior_mean  # noqa: E402
-from belay.fit import fit, shadow_traces  # noqa: E402
-from belay.model import Check, Job, RunModel  # noqa: E402
+from belay.fit import _fit_check, fit, shadow_traces  # noqa: E402
+from belay.model import Check, Job, RunModel, frailty_nodes  # noqa: E402
 from belay.placement import segment_tables, _dp  # noqa: E402
 from belay.simulate import World, adaptive, every_step, no_checks, periodic, simulate, static, voting  # noqa: E402
 from belay.theory import retry_success  # noqa: E402
@@ -148,6 +154,8 @@ ENV_ORDER = ["retail", "airline", "tac", "backoffice"]
 RETRY = dict(retry_fresh=0.85, retry_inplace=1.9, max_retries=2, rollback_cost=0.35)
 DRIFT = 0.25
 VOTE_CORR = 0.55
+LONG_Q = 0.75  # the drift ablation reports the longest quartile of back-office jobs
+DRIFT_LAM = 0.03  # a second, lower price at which the drift ablation shows where critics go
 
 
 def build_jobs(name):
@@ -260,6 +268,105 @@ def accuracy_model(model, base_rate):
     return replace(model, checks=tuple(checks))
 
 
+# ---------------------------------------------------------------- hazard drift (Section 6 ablation)
+
+@dataclass(frozen=True)
+class DriftModel(RunModel):
+    """The planning model with an age-dependent hazard: step i of n has hazard eta * (1 + kappa * (i-1)/(n-1)).
+
+    One more parameter than BELAY's model. The simulated ground truth drifts in the same form
+    (``World.drift``), so this is the correctly specified drift term; the planner uses it through
+    ``eta``, which every segment table and the survivor posterior read.
+    """
+
+    drift: float = 0.0
+
+    def eta(self, job: Job) -> np.ndarray:
+        ramp = np.linspace(0.0, 1.0, job.n) if job.n > 1 else np.zeros(1)
+        return np.asarray(self.hazard, dtype=float)[job.types] * (1 + self.drift * ramp)
+
+
+def _drift_counts(jobs, tr, n_types):
+    """Per run: type counts, and counts weighted by the step's place on the ramp (i-1)/(n-1), before the
+    first error and over the whole job; the error's type and its place on the ramp."""
+    N = len(tr.run_job)
+    b0, b1, t0, t1 = (np.zeros((N, n_types)) for _ in range(4))
+    etype, eramp = np.full(N, -1), np.zeros(N)
+    for r in range(N):
+        job = jobs[tr.run_job[r]]
+        ramp = np.linspace(0.0, 1.0, job.n) if job.n > 1 else np.zeros(1)
+        t0[r] = np.bincount(job.types, minlength=n_types)
+        t1[r] = np.bincount(job.types, weights=ramp, minlength=n_types)
+        T = tr.first_error[r]
+        if T > 0:
+            b0[r] = np.bincount(job.types[: T - 1], minlength=n_types)
+            b1[r] = np.bincount(job.types[: T - 1], weights=ramp[: T - 1], minlength=n_types)
+            etype[r], eramp[r] = job.types[T - 1], ramp[T - 1]
+    return b0, b1, t0, t1, etype, eramp
+
+
+def _drift_posterior(tr, counts, eta, var, kappa, q=48):
+    """Frailty nodes and, per task, posterior log-weights given its runs' first-error times under drift."""
+    b0, b1, t0, t1, etype, eramp = counts
+    z, w = frailty_nodes(var, q)
+    event = etype >= 0
+    Hb = (b0 + kappa * b1) @ eta
+    hT = np.where(event, eta[np.maximum(etype, 0)] * (1 + kappa * eramp), 0.0)
+    Hn = (t0 + kappa * t1) @ eta
+    ev = -np.outer(Hb, z) + np.log(-np.expm1(-np.outer(hT, z).clip(1e-12)))
+    ll = np.where(event[:, None], ev, -np.outer(Hn, z))
+    per_task = np.zeros((tr.run_job.max() + 1, len(z)))
+    np.add.at(per_task, tr.run_job, ll)
+    return z, np.log(w)[None, :] + per_task
+
+
+def _drift_retry(tr, counts, eta, var, kappa, mode):
+    """A recovery mode's hazard multiplier, as belay.fit does it, with the retried step's drifted hazard."""
+    etype, eramp = counts[4], counts[5]
+    sel = tr.retry_mode == mode
+    runs, ok = tr.retry_run[sel], tr.retry_ok[sel].astype(float)
+    z, lp = _drift_posterior(tr, counts, eta, var, kappa)
+    post = np.exp(lp - lp.max(axis=1, keepdims=True))
+    post = (post / post.sum(axis=1, keepdims=True))[tr.run_job[runs]]
+    et = eta[etype[runs]] * (1 + kappa * eramp[runs])
+
+    def nll(log_rho):
+        p = np.clip((post * np.exp(-np.exp(log_rho) * np.outer(et, z))).sum(axis=1), 1e-9, 1 - 1e-9)
+        return -(ok * np.log(p) + (1 - ok) * np.log1p(-p)).sum()
+
+    return float(np.exp(optimize.minimize_scalar(nll, bounds=(np.log(0.05), np.log(8.0)), method="bounded").x))
+
+
+def fit_drift(jobs, tr, template: RunModel) -> DriftModel:
+    """BELAY's fit with a hazard drift kappa: hazards, frailty variance and kappa jointly by the marginal
+    likelihood of first-error times; checks exactly as belay.fit; retry multipliers under the drifted hazard."""
+    n_types = len(template.hazard)
+    counts = _drift_counts(jobs, tr, n_types)
+
+    def nll(theta):
+        _, lp = _drift_posterior(tr, counts, np.exp(theta[:n_types]), float(np.exp(theta[n_types])), float(theta[n_types + 1]))
+        top = lp.max(axis=1, keepdims=True)
+        return -(top[:, 0] + np.log(np.exp(lp - top).sum(axis=1))).sum()
+
+    x0 = np.concatenate([np.full(n_types, np.log(0.03)), [np.log(0.5), 0.0]])
+    res = optimize.minimize(nll, x0, method="L-BFGS-B", bounds=[(None, None)] * (n_types + 1) + [(-0.9, 4.0)])
+    eta, var, kappa = np.exp(res.x[:n_types]), float(np.exp(res.x[n_types])), float(res.x[n_types + 1])
+    checks = tuple(_fit_check(c, tr, v, n_types, True) for v, c in enumerate(template.checks))
+    return DriftModel(hazard=tuple(float(x) for x in eta), checks=checks, frailty_var=var,
+                      retry_fresh=_drift_retry(tr, counts, eta, var, kappa, 0), retry_inplace=_drift_retry(tr, counts, eta, var, kappa, 1),
+                      max_retries=template.max_retries, rollback_cost=template.rollback_cost, drift=kappa)
+
+
+def critic_profile(plans, crit, bins=10):
+    """Critics per job in each tenth of the run, averaged over the given (n, checks) plans."""
+    h = np.zeros(bins)
+    for n, checks in plans:
+        for b, v in checks:
+            if v == crit:
+                h[min(int((b - 1) / n * bins), bins - 1)] += 1
+    return (h / max(len(plans), 1)).tolist()
+
+
 def run_env_seed(args):
     """All policies on one environment for one seed, with cross-fitted planning models."""
     name, seed = args
@@ -284,6 +391,11 @@ def run_env_seed(args):
     preds = {}  # (model kind, policy) -> predicted success per task
     fitted_params = []
     traces_store = []
+    kappas = []  # the drift fit's kappa, one per fold
+    lens = np.array([j.n for j in jobs])
+    long_ = lens >= np.quantile(lens, LONG_Q)
+    drift_li = LAMS.index(DRIFT_LAM)
+    plans_long = {"belay": [], "drift": [], "belay-low": [], "drift-low": []}  # (n, checks) on the longest jobs
     for fi, test in enumerate(folds):
         dev = np.setdiff1d(np.arange(nt), test)
         dev_jobs = [jobs[i] for i in dev]
@@ -293,6 +405,8 @@ def run_env_seed(args):
         m_indep = fit(dev_jobs, tr, template=world.model, frailty=False, latency=False, retry_modes=False)
         m_nofrail = fit(dev_jobs, tr, template=world.model, frailty=False)
         m_nolat = fit(dev_jobs, tr, template=world.model, latency=False)
+        m_drift = fit_drift(dev_jobs, tr, world.model)
+        kappas.append(m_drift.drift)
         base_rate = float((tr.first_error > 0).mean()) / max(np.mean([j.n for j in dev_jobs]), 1)
         m_acc = accuracy_model(m_belay, base_rate)
         fitted_params.append(dict(
@@ -335,6 +449,23 @@ def run_env_seed(args):
             sim(static(plans_for(job, m_inpl, [lam], 0, Q)[0][0], mode="inplace"), "abl-inplace")
             job_ni = Job(types=job.types, costs=job.costs, irreversible=np.zeros(job.n, bool))
             sim(static(plans_for(job_ni, m_belay, [lam], 0, Q)[0][0]), "abl-no-irreversible")
+            # hazard drift: plans from the fit with kappa, swept over every price, on their own random stream
+            # (same tasks and frailty draws), so that every policy above is drawn exactly as before
+            Pd = plans_for(job, m_drift, LAMS, 0, Q)[0]
+            drng = np.random.default_rng([MASTER, 71, ENV_ORDER.index(name), seed, int(t)])
+            for li in range(len(LAMS)):
+                record(f"drift-{li}", t, simulate(job, world, static(Pd[li]), T, drng, z=zt))
+            if name == "backoffice":
+                # the paired comparison: both plans from one seed per (job, price), so identical plans give identical runs
+                for li in range(len(LAMS)):
+                    g = [MASTER, 72, seed, int(t), li]
+                    record(f"crn-belay-{li}", t, simulate(job, world, static(P[0][li]), T, np.random.default_rng(g), z=zt))
+                    record(f"crn-drift-{li}", t, simulate(job, world, static(Pd[li]), T, np.random.default_rng(g), z=zt))
+            if long_[t]:
+                plans_long["belay"].append((job.n, P[0][star].checks))
+                plans_long["drift"].append((job.n, Pd[star].checks))
+                plans_long["belay-low"].append((job.n, P[0][drift_li].checks))
+                plans_long["drift-low"].append((job.n, Pd[drift_li].checks))
 
             # predictions of static policies by the two fitted models
             prng = np.random.default_rng([MASTER, 7, ENV_ORDER.index(name), seed, int(t)])
@@ -360,7 +491,14 @@ def run_env_seed(args):
             tokens=float(r["tokens"].mean() / base_cost.mean()),
             pass_k=[pass_hat_k(succ_task, T, k) for k in range(1, T + 1)],
             per_task=r["success"].mean(axis=1).tolist(),
+            per_task_tokens=r["tokens"].mean(axis=1).tolist(),
         )
+    # the drift ablation: the fitted kappas, and every policy on the longest quartile of jobs
+    out["kappa"] = kappas
+    out["long"] = {key: dict(success=float(r["success"][long_].mean()), tokens=float(r["tokens"][long_].mean() / base_cost[long_].mean()))
+                   for key, r in res.items()}
+    crit_idx = env["critic"]
+    out["critics_long"] = {k: critic_profile(v, crit_idx) for k, v in plans_long.items()}
     for (kind, key), arr in preds.items():
         out["pred"][f"{kind}:{key}"] = dict(success=float(arr[:, 0].mean()), pass4=float(arr[:, 1].mean()))
 
@@ -449,6 +587,11 @@ def horizon_point(args):
     res["every"] = (float(ev.success.mean()), float(ev.tokens.mean() / base))
     vt = simulate(job, world, voting(3), len(zz), rng, z=zz)
     res["vote3"] = (float(vt.success.mean()), float(vt.tokens.mean() / base))
+    # hazard drift: BELAY's planner told the drift (every planner here uses the true parameters); drawn last,
+    # so every policy above is drawn exactly as before
+    dm = DriftModel(**{f: getattr(plan_model, f) for f in ("hazard", "checks", "frailty_var", "retry_fresh", "retry_inplace", "max_retries", "rollback_cost")}, drift=DRIFT)
+    tab_d = segment_tables(job, dm, q=Q, window=w)
+    res["belay-drift"] = best_under_budget([static(_dp(job, tab_d, local_price(job, tab_d, l))) for l in lams])
     return n, var, seed, res
 
 
@@ -640,12 +783,123 @@ def aggregate_envs(env_out):
                 pass_k=[mean_sd([o["policies"][k]["pass_k"][i] for o in outs]) for i in range(len(outs[0]["policies"][k]["pass_k"]))],
                 per_task=np.mean([o["policies"][k]["per_task"] for o in outs], axis=0).tolist(),
             )
+            if "per_task_tokens" in outs[0]["policies"][k]:
+                pol[k]["per_task_tokens"] = np.mean([o["policies"][k]["per_task_tokens"] for o in outs], axis=0).tolist()
         pred = {k: dict(success=float(np.mean([o["pred"][k]["success"] for o in outs])), pass4=float(np.mean([o["pred"][k]["pass4"] for o in outs])))
                 for k in outs[0]["pred"]}
         envs[name] = dict(title=ENVS[name]["title"], policies=pol, pred=pred, fits=outs[0]["fits"], scale=outs[0]["scale"], var=outs[0]["var"],
                           tasks=ENVS[name]["tasks"], trials=ENVS[name]["trials"], retry=outs[0].get("retry"),
                           steps=[int(j.n) for j in build_jobs(name)])
+        if "long" in outs[0]:
+            envs[name]["long"] = {k: dict(success=mean_sd([o["long"][k]["success"] for o in outs]), tokens=mean_sd([o["long"][k]["tokens"] for o in outs]))
+                                  for k in outs[0]["long"]}
+            envs[name]["kappa"] = mean_sd([x for o in outs for x in o["kappa"]])
+            envs[name]["critics_long"] = {k: np.mean([o["critics_long"][k] for o in outs], axis=0).tolist() for k in outs[0]["critics_long"]}
     return envs
+
+
+# ---------------------------------------------------------------- statistical reporting
+
+def boot_ci(x, rng, B=10000):
+    """Mean of per-task values (points) and its 95% percentile bootstrap interval over tasks."""
+    x = 100 * np.asarray(x, float)
+    b = x[rng.integers(0, len(x), (B, len(x)))].mean(axis=1)
+    lo, hi = np.percentile(b, [2.5, 97.5])
+    return dict(mean=float(x.mean()), lo=float(lo), hi=float(hi), n=int(len(x)))
+
+
+def paired(a, b, rng, B=10000):
+    """a - b over the same tasks (points): mean, 95% paired-bootstrap interval, Wilcoxon signed-rank p."""
+    d = 100 * (np.asarray(a, float) - np.asarray(b, float))
+    bb = d[rng.integers(0, len(d), (B, len(d)))].mean(axis=1)
+    lo, hi = np.percentile(bb, [2.5, 97.5])
+    nz = d[np.abs(d) > 1e-12]
+    p = float(stats.wilcoxon(nz).pvalue) if len(nz) >= 2 else 1.0
+    return dict(diff=float(d.mean()), lo=float(lo), hi=float(hi), p=p, n=int(len(d)))
+
+
+def efficient(pts):
+    """Efficient points of a sweep of (cost, success): each better than every cheaper point."""
+    out, best = [], -1.0
+    for c, s in sorted(pts):
+        if s > best:
+            out.append((c, s))
+            best = s
+    return out
+
+
+def matched_gain(pts_a, pts_b):
+    """Mean over sweep b's points of sweep a's frontier at the same cost minus b's success (points), as
+    frontier_at does it; points of b cheaper than a's cheapest are skipped."""
+    fa = efficient(pts_a)
+    xs, ys = [f[0] for f in fa], [f[1] for f in fa]
+    d = [100 * (float(np.interp(c, xs, ys)) - s) for c, s in pts_b if c >= xs[0] * 0.98]
+    return float(np.mean(d)) if d else None
+
+
+def task_arrays(pol):
+    """Seed-averaged per-task success and tokens of every policy, as arrays."""
+    return {k: (np.asarray(v["per_task"], float), np.asarray(v["per_task_tokens"], float)) for k, v in pol.items() if "per_task_tokens" in v}
+
+
+def sweep_points(arr, prefix, idx, base):
+    """(relative tokens, success) of a swept method over the tasks idx, from seed-averaged per-task values."""
+    bc = base[idx].mean()
+    return [(float(arr[f"{prefix}-{i}"][1][idx].mean() / bc), float(arr[f"{prefix}-{i}"][0][idx].mean())) for i in range(len(LAMS))]
+
+
+def boot_gain(arr, a, b, tasks, base, rng, B=2000):
+    """matched_gain of sweep a over sweep b on the given tasks, with a 95% bootstrap interval over them."""
+    tasks = np.asarray(tasks)
+    point = matched_gain(sweep_points(arr, a, tasks, base), sweep_points(arr, b, tasks, base))
+    boots = [matched_gain(sweep_points(arr, a, s, base), sweep_points(arr, b, s, base)) for s in (tasks[rng.integers(0, len(tasks), len(tasks))] for _ in range(B))]
+    boots = np.array([x for x in boots if x is not None])
+    lo, hi = np.percentile(boots, [2.5, 97.5])
+    return dict(diff=point, lo=float(lo), hi=float(hi), p_le0=float((boots <= 0).mean()), n=int(len(tasks)))
+
+
+def statistics(R):
+    """Intervals and paired tests behind the headline comparisons (needs the per-task values of a fresh run)."""
+    rng = np.random.default_rng([MASTER, 81])
+    star = R["lams"].index(R["lam_star"])
+    S = {}
+    for e in ENV_ORDER:
+        pol = R["envs"][e]["policies"]
+        base = np.array([j.costs.sum() for j in build_jobs(e)])
+        allt = np.arange(len(base))
+        pt = lambda k: pol[k]["per_task"]
+        S[e] = dict(
+            belay=boot_ci(pt(f"static-{star}"), rng),
+            vs_none=paired(pt(f"static-{star}"), pt("none"), rng),
+            vs_every=paired(pt(f"static-{star}"), pt("every"), rng),
+            vs_indep=paired(pt(f"static-{star}"), pt(f"indep-{star}"), rng),
+            gain_indep=boot_gain(task_arrays(pol), MAIN, "indep", allt, base, rng),
+        )
+    # the drift ablation on the longest quartile of back-office jobs
+    pol = R["envs"]["backoffice"]["policies"]
+    base = np.array([j.costs.sum() for j in build_jobs("backoffice")])
+    lens = np.array([j.n for j in build_jobs("backoffice")])
+    longt = np.flatnonzero(lens >= np.quantile(lens, LONG_Q))
+    S["drift_long"] = dict(
+        at_star=paired(np.asarray(pol[f"crn-drift-{star}"]["per_task"])[longt], np.asarray(pol[f"crn-belay-{star}"]["per_task"])[longt], rng),
+        n=int(len(longt)), min_steps=int(lens[longt].min()), max_steps=int(lens[longt].max()),
+    )
+    for e in ("retail", "backoffice"):
+        pe = R["envs"][e]["policies"]
+        S[e]["drift_all"] = paired(pe[f"drift-{star}"]["per_task"], pe[f"static-{star}"]["per_task"], rng)
+    # prediction: absolute errors of the two fitted models on the same held-out (policy, benchmark) pairs
+    ab, ai, pb, pi = [], [], [], []
+    for e in ENV_ORDER:
+        pe, pred = R["envs"][e]["policies"], R["envs"][e]["pred"]
+        for k in [k.split(":", 1)[1] for k in pred if k.startswith("belay:")]:
+            ab.append(abs(pred[f"belay:{k}"]["success"] - pe[k]["success"][0]))
+            ai.append(abs(pred[f"indep:{k}"]["success"] - pe[k]["success"][0]))
+            if e in ("retail", "airline"):
+                pb.append(abs(pred[f"belay:{k}"]["pass4"] - pe[k]["pass_k"][3][0]))
+                pi.append(abs(pred[f"indep:{k}"]["pass4"] - pe[k]["pass_k"][3][0]))
+    S["pred"] = dict(n=len(ab), p=float(stats.wilcoxon(np.array(ab) - np.array(ai)).pvalue),
+                     n4=len(pb), p4=float(stats.wilcoxon(np.array(pb) - np.array(pi)).pvalue))
+    return S
 
 
 def finish(R):
@@ -655,15 +909,25 @@ def finish(R):
         R["envs"][name]["matched"] = {
             key: dict(cost=pol[key]["tokens"][0], success=pol[key]["success"][0],
                       belay=frontier_at(pol, MAIN, pol[key]["tokens"][0]), indep=frontier_at(pol, "indep", pol[key]["tokens"][0]))
-            for key in pol if not key.startswith(("belay-", "static-", "indep-"))
+            for key in pol if not key.startswith(("belay-", "static-", "indep-", "drift-", "crn-"))
         }
     hl = {}
-    for pol in ("none", "periodic", "indep", "belay", "belay-nf", "every"):
-        hl[pol] = half_life(HORIZONS, [R["horizon"][f"{n}|1.0"][pol]["success"][0] for n in HORIZONS])
+    for pol in ("none", "periodic", "indep", "belay", "belay-nf", "every", "belay-drift"):
+        if all(pol in R["horizon"][f"{n}|1.0"] for n in HORIZONS):
+            hl[pol] = half_life(HORIZONS, [R["horizon"][f"{n}|1.0"][pol]["success"][0] for n in HORIZONS])
     R["half_life"] = hl
+    if "per_task_tokens" in R["envs"]["backoffice"]["policies"]["none"]:  # a fresh run: compute the statistics
+        R["stats"] = statistics(R)
+    R.get("stats", {}).get("drift_long", {}).pop("gain", None)  # superseded by the per-price comparison below
+    L = R["envs"]["backoffice"].get("long", {})
+    if "crn-belay-0" in L:  # drift: the same price, the same random numbers; success and token differences per price
+        ds = [100 * (L[f"crn-drift-{i}"]["success"][0] - L[f"crn-belay-{i}"]["success"][0]) for i in range(len(LAMS))]
+        dt = [L[f"crn-drift-{i}"]["tokens"][0] - L[f"crn-belay-{i}"]["tokens"][0] for i in range(len(LAMS))]
+        R["drift_long"] = dict(success_diff=ds, tokens_diff=dt, mean=float(np.mean(ds)), max_abs=float(np.max(np.abs(ds))), max_abs_tokens=float(np.max(np.abs(dt))))
     for env in R["envs"].values():  # per-task means are not reported; keep results.json small
         for p in env["policies"].values():
             p.pop("per_task", None)
+            p.pop("per_task_tokens", None)
     with open(os.path.join(ROOT, "results.json"), "w") as f:
         json.dump(R, f, indent=1)
     write_tables(R)
@@ -759,8 +1023,11 @@ def write_numbers(R):
     for e in ("retail", "backoffice"):
         pol = R["envs"][e]["policies"]
         t = tag[e]
-        for key, name in (("abl-no-frailty", "NoFrailty"), ("abl-no-latency", "NoLatency"), ("abl-inplace", "Inplace"),
-                          ("abl-no-irreversible", "NoIrreversible"), ("abl-accuracy", "Accuracy"), (f"belay-{star}", "Adaptive")):
+        abl_keys = [("abl-no-frailty", "NoFrailty"), ("abl-no-latency", "NoLatency"), ("abl-inplace", "Inplace"),
+                    ("abl-no-irreversible", "NoIrreversible"), ("abl-accuracy", "Accuracy"), (f"belay-{star}", "Adaptive")]
+        if f"drift-{star}" in pol:
+            abl_keys.append((f"drift-{star}", "Drift"))
+        for key, name in abl_keys:
             full = frontier_at(pol, MAIN, pol[key]["tokens"][0])
             raw = 100 * (pol[key]["success"][0] - pol[f"{MAIN}-{star}"]["success"][0])
             out[f"{t}Abl{name}Raw"] = f"{raw:+.1f}"
@@ -833,13 +1100,51 @@ def write_numbers(R):
         out[f"Dup{name}"] = f"{D[k]['dups'][0]:.1f}"
     out["DurOverhead"] = f"{100 * D['overhead_journal'][0]:.0f}"
     # horizon
-    for pol, name in (("none", "None"), ("periodic", "Periodic"), ("indep", "Indep"), ("belay", "Belay"), ("belay-nf", "BelayNf"), ("every", "Every")):
+    for pol, name in (("none", "None"), ("periodic", "Periodic"), ("indep", "Indep"), ("belay", "Belay"), ("belay-nf", "BelayNf"), ("every", "Every"), ("belay-drift", "BelayDrift")):
+        if pol == "belay-drift" and pol not in R["half_life"]:
+            continue
         v = R["half_life"].get(pol)
         out[f"Half{name}"] = "---" if v is None else f"{v:.0f}"
         for n, word in ((100, "Hundred"), (200, "TwoHundred"), (500, "FiveHundred"), (1000, "Thousand")):
             k = f"{n}|1.0"
             if k in R["horizon"] and pol in R["horizon"][k]:
                 out[f"Hz{name}{word}"] = f"{100 * R['horizon'][k][pol]['success'][0]:.1f}"
+    # hazard drift: the fitted kappa, and the longest quartile of back-office jobs under common random numbers
+    bo = R["envs"]["backoffice"]
+    if "crn-belay-0" in bo.get("long", {}):
+        L, cl = bo["long"], bo["critics_long"]
+        out["DriftKappa"], out["DriftKappaSd"], out["DriftTrue"] = f"{bo['kappa'][0]:.2f}", f"{bo['kappa'][1]:.2f}", f"{DRIFT:.2f}"
+        for key, name in ((f"crn-belay-{star}", "LongBelay"), (f"crn-drift-{star}", "LongDrift"), ("none", "LongNone"), ("every", "LongEvery"),
+                          (f"indep-{star}", "LongIndep")):
+            out[name] = f"{100 * L[key]['success'][0]:.1f}"
+            out[f"{name}Tok"] = f"{L[key]['tokens'][0]:.2f}"
+        for key, name in (("belay", "Belay"), ("drift", "Drift"), ("belay-low", "BelayLow"), ("drift-low", "DriftLow")):
+            out[f"LongCrit{name}"] = f"{sum(cl[key]):.1f}"  # critics per job
+            out[f"LongCritLate{name}"] = f"{sum(cl[key][7:]):.1f}"  # of which in the last 30% of the run
+        out["DriftLam"] = f"{DRIFT_LAM:g}"
+        dl = R["drift_long"]
+        out["LongDriftMeanDiff"] = f"{dl['mean']:+.1f}".replace("-", "$-$")
+        out["LongDriftMaxDiff"] = f"{dl['max_abs']:.1f}"
+        out["LongDriftMaxTok"] = f"{dl['max_abs_tokens']:.3f}"
+    S = R.get("stats")
+    if S:
+        sgn = lambda x: f"{x:+.1f}".replace("-", "$-$")
+        for e in ENV_ORDER:
+            t = tag[e]
+            out[f"{t}BelayLo"], out[f"{t}BelayHi"] = f"{S[e]['belay']['lo']:.1f}", f"{S[e]['belay']['hi']:.1f}"
+            for key, name in (("vs_none", "VsNone"), ("vs_every", "VsEvery"), ("vs_indep", "VsIndep")):
+                c = S[e][key]
+                out[f"{t}{name}"], out[f"{t}{name}Lo"], out[f"{t}{name}Hi"], out[f"{t}{name}P"] = sgn(c["diff"]), sgn(c["lo"]), sgn(c["hi"]), fmt_p(c["p"])
+            g = S[e]["gain_indep"]
+            out[f"{t}GainOverIndepLo"], out[f"{t}GainOverIndepHi"] = f"{g['lo']:.1f}", f"{g['hi']:.1f}"
+            if "drift_all" in S[e]:
+                c = S[e]["drift_all"]
+                out[f"{t}DriftAll"], out[f"{t}DriftAllLo"], out[f"{t}DriftAllHi"], out[f"{t}DriftAllP"] = sgn(c["diff"]), sgn(c["lo"]), sgn(c["hi"]), fmt_p(c["p"])
+        dl = S["drift_long"]
+        out["LongN"], out["LongMin"], out["LongMax"] = str(dl["n"]), str(dl["min_steps"]), str(dl["max_steps"])
+        c = dl["at_star"]
+        out["LongDriftDiff"], out["LongDriftDiffLo"], out["LongDriftDiffHi"], out["LongDriftDiffP"] = sgn(c["diff"]), sgn(c["lo"]), sgn(c["hi"]), fmt_p(c["p"])
+        out["PredP"], out["PredFourP"], out["NPredFour"] = fmt_p(S["pred"]["p"]), fmt_p(S["pred"]["p4"]), str(S["pred"]["n4"])
     with open(os.path.join(ROOT, "tables", "numbers.tex"), "w") as f:
         for k, v in sorted(out.items()):
             f.write(f"\\newcommand{{\\{k}}}{{{v}}}\n".replace("\\\\", "\\"))
@@ -848,6 +1153,11 @@ def write_numbers(R):
 
 
 # ---------------------------------------------------------------- tables
+
+def fmt_p(p):
+    """A p-value as the text prints it."""
+    return "$p<0.001$" if p < 0.001 else (f"$p={p:.3f}$" if p < 0.01 else f"$p={p:.2f}$")
+
 
 def pct(ms, bold=False, sd=True):
     m, s = ms
@@ -906,6 +1216,11 @@ def write_tables(R):
             ours = key.startswith("static")
             cells += [pct(p["success"], bold=ours), tok(p["tokens"])]
         lines.append(f"{label} & " + " & ".join(cells) + " \\\\")
+        if ours and R.get("stats"):  # the headline row's 95% bootstrap interval over tasks
+            cells = []
+            for e in ENV_ORDER:
+                cells += [f"{{\\scriptsize [{R['stats'][e]['belay']['lo']:.1f}, {R['stats'][e]['belay']['hi']:.1f}]}}", ""]
+            lines.append("\\quad 95\\% CI over tasks & " + " & ".join(cells) + " \\\\")
     tex_title = dict(retail="$\\tau$-bench retail", airline="$\\tau$-bench airline", tac="TheAgentCompany", backoffice="Back-office jobs")
     hdr = "\\begin{tabular}{l" + "rr" * 4 + "}\n\\toprule\n & " + " & ".join(f"\\multicolumn{{2}}{{c}}{{{tex_title[e]}}}" for e in ENV_ORDER) + " \\\\\n"
     hdr += " ".join(f"\\cmidrule(lr){{{2 + 2 * i}-{3 + 2 * i}}}" for i in range(4)) + "\n"
@@ -917,6 +1232,8 @@ def write_tables(R):
     abl = [("\\textsc{Belay}", f"static-{star}"), ("$-$ frailty", "abl-no-frailty"), ("$+$ re-planning after flags", f"belay-{star}"),
            ("$-$ recall by latency", "abl-no-latency"), ("Retry in place", "abl-inplace"),
            ("$-$ irreversibility", "abl-no-irreversible"), ("Checks ranked by accuracy", "abl-accuracy")]
+    if f"drift-{star}" in R["envs"]["retail"]["policies"]:
+        abl.append(("$+$ hazard drift ($\\hat\\kappa$ fitted)", f"drift-{star}"))
     lines = []
     for label, key in abl:
         cells = []
@@ -955,6 +1272,19 @@ if __name__ == "__main__":
         with Pool(WORKERS) as pool:
             env_out = pool.map(run_env_seed, [(e, s_) for e in ENV_ORDER for s_ in SEEDS])
         R["envs"] = aggregate_envs(env_out)
+        R["placement"] = placement_map()
+        finish(R)
+    elif "--update" in sys.argv:  # recompute the benchmarks, the horizon study and the placement map; keep transfer and durability
+        R = json.load(open(os.path.join(ROOT, "results.json")))
+        with Pool(WORKERS) as pool:
+            hz_async = pool.map_async(horizon_point, [(n, 1.0, s_) for n in HORIZONS for s_ in SEEDS[:3]] + [(200, v, s_) for v in SYN_VARS for s_ in SEEDS[:3]])
+            env_out = pool.map(run_env_seed, [(e, s_) for e in ENV_ORDER for s_ in SEEDS])
+            hz = hz_async.get()
+        R["envs"] = aggregate_envs(env_out)
+        H = {}
+        for n, var, s_, res in hz:
+            H.setdefault(f"{n}|{var}", []).append(res)
+        R["horizon"] = {k: {pol: dict(success=mean_sd([r[pol][0] for r in v]), tokens=mean_sd([r[pol][1] for r in v if r[pol][1] is not None])) for pol in v[0]} for k, v in H.items()}
         R["placement"] = placement_map()
         finish(R)
     elif "--tables-only" in sys.argv:  # rewrite tables, numbers and the site export from an existing results.json

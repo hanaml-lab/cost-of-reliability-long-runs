@@ -86,15 +86,15 @@ These numbers come from the report's seeded simulation and are illustrative. Qwe
 
 | Policy | τ-bench retail | Tokens | Back-office | Tokens |
 |---|---|---|---|---|
-| Single agent | 52.2 | 1.00× | 48.4 | 1.00× |
-| Critic after every step | 64.9 | 2.08× | 61.8 | 2.06× |
-| Periodic critic, T = 4 | 58.3 | 1.36× | 54.0 | 1.33× |
-| Independent-step program | 60.5 | 1.13× | 64.5 | 1.16× |
-| **BELAY** | **63.6** | **1.22×** | **67.9** | **1.21×** |
+| Single agent | 52.3 | 1.00× | 47.8 | 1.00× |
+| Critic after every step | 65.0 | 2.08× | 62.4 | 2.06× |
+| Periodic critic, T = 4 | 58.5 | 1.36× | 54.5 | 1.33× |
+| Independent-step program | 60.6 | 1.13× | 64.1 | 1.16× |
+| **BELAY** | **63.5** | **1.22×** | **67.7** | **1.21×** |
 
-Model prediction on held-out policies: mean absolute error 0.8 points (independent-step fit: 4.5); pass^4 1.0 (independent-step fit: 16.4). Durable journal with idempotency keys: 97% of successful jobs survive an injected crash, against 38% for restarting an in-memory loop.
+Model prediction on held-out policies: mean absolute error 0.8 points (independent-step fit: 4.5); pass^4 1.1 (independent-step fit: 16.4). A fitted hazard drift changes the plans for back-office jobs by less than seed noise. Durable journal with idempotency keys: 97% of successful jobs survive an injected crash, against 38% for restarting an in-memory loop.
 
-`bash scripts/reproduce_paper.sh` regenerates the tables and figures that the report's seeded simulation produces (about ten minutes on 16 cores; `WORKERS` sets the number of processes). The report's tables were generated with SciPy linked against Intel MKL. This simulation fits its models with SciPy's optimisers, so it is sensitive to the BLAS build: with the PyPI wheels (OpenBLAS) the regenerated tables differ from the report's by at most 1.2 points, and by 0.1 on the headline row (for example BELAY on τ-bench retail, 63.5 instead of 63.6). A figure derived from them moves further: at the success of a critic after every step, BELAY saves 55% of the extra tokens rather than the report's 65%. CI regenerates the tables in a pinned environment (numpy 2.3.5, SciPy 1.16.3, one OpenBLAS kernel and thread) and checks them against `paper/results.sha256`, which records that environment's output; `python paper/check_results.py` runs the same check.
+`bash scripts/reproduce_paper.sh` regenerates the tables and figures that the report's seeded simulation produces (about ten minutes on 16 cores; `WORKERS` sets the number of processes). The report's tables are generated in the environment CI pins (Python 3.12, numpy 2.3.5, SciPy 1.16.3, one OpenBLAS kernel and thread), and `paper/results.sha256` records that environment's output, so CI's paper job checks that this code reproduces the report's numbers exactly; `python paper/check_results.py` runs the same check. The simulation fits its models with SciPy's optimisers, so it is sensitive to the BLAS build: with another build, such as SciPy linked against Intel MKL, table entries move by up to 1.2 points, and a figure read off the price grid moves further. The report therefore states such a figure only as coarsely as that allows: BELAY matches the success of a critic after every step below 1.5× the tokens of a single run, with less than half of the critic's extra tokens.
 
 ## Layout
 
