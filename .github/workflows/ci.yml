@@ -1,0 +1,59 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - run: pip install -e ".[dev]"
+      - run: ruff check .
+      - run: pytest -q
+      - name: Toy run on CPU
+        run: python -m belay.demo
+      - name: Example on the bundled sample data
+        run: python examples/plan_job.py examples/data/ap_job.yaml
+
+  paper:
+    # Regenerates the report's tables and results from the seeded simulation and checks them against the
+    # digests in paper/results.sha256, with the library versions the digests were recorded with.
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      # One BLAS kernel and thread, and numpy's AVX2 loops even on AVX-512 runners, so the results do not depend
+      # on the runner's CPU.
+      OPENBLAS_CORETYPE: Haswell
+      OPENBLAS_NUM_THREADS: "1"
+      NPY_DISABLE_CPU_FEATURES: "AVX512F AVX512CD AVX512_SKX AVX512_CLX AVX512_CNL AVX512_ICL AVX512_SPR"
+      WORKERS: "4"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install "numpy==2.3.5" "scipy==1.16.3"
+      - run: python paper/make_data.py > /dev/null
+      - run: python paper/check_results.py
+      - name: CITATION.cff is valid
+        run: pipx run cffconvert --validate

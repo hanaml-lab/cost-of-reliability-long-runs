@@ -73,7 +73,7 @@ def segment_tables(job: Job, model: RunModel, *, q: int = 16, detections: int = 
 
     Returns (S, C, tail_S, tail_C, valid) with S, C, valid of shape (n, W, V) and the tails of shape (n,).
     """
-    n, V = job.n, len(model.checks)
+    n = job.n
     W = min(n, window or 64)
     eta = model.eta(job)
     H = np.concatenate([[0.0], np.cumsum(eta)])

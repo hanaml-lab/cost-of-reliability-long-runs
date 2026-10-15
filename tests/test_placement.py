@@ -24,11 +24,13 @@ def objective(job, model, plan, lam, q):
     H = np.concatenate([[0.0], np.cumsum(eta)])
     total, a = 0.0, 0
     for b, v in plan:
-        post = w * np.exp(-z * H[a]); post /= post.sum()
+        post = w * np.exp(-z * H[a])
+        post /= post.sum()
         outs = [segment_outcome(job, model, a, b, v, z=zi) for zi in z]
         total += math.log(sum(pi * s for pi, (s, _) in zip(post, outs))) - lam * sum(pi * c for pi, (_, c) in zip(post, outs))
         a = b
-    post = w * np.exp(-z * H[a]); post /= post.sum()
+    post = w * np.exp(-z * H[a])
+    post /= post.sum()
     total += math.log((post * np.exp(-z * (H[-1] - H[a]))).sum()) - lam * job.costs[a:].sum()
     return total
 

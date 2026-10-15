@@ -536,7 +536,6 @@ def durability(seed):
     out = {k: dict(retained=0, base=0, dups=0) for k in ("scratch", "snapshot", "durable", "durable-keys")}
     over = []
     for t, job in enumerate(jobs):
-        lam = LAM_STAR / job.costs.sum()
         ok0 = simulate(job, world, no_checks(), 1, rng, z=np.array([z[t]])).success[0]
         rerun_ok = simulate(job, world, no_checks(), 1, rng, z=np.array([z[t]])).success[0]
         dur = rng.lognormal(math.log(DUR["step_ms"]), 0.6, job.n)
@@ -789,7 +788,7 @@ def write_numbers(R):
         out[f"Mae{name}"] = f"{100 * np.mean(np.abs(errs)):.1f}"
         out[f"MaxErr{name}"] = f"{100 * np.max(np.abs(errs)):.1f}"
         out[f"PassFourMae{name}"] = f"{100 * np.mean(np.abs(e4)):.1f}"
-        out[f"NPred"] = str(len(errs))
+        out["NPred"] = str(len(errs))
     # pass^k on tau-bench
     pk_rows = [("Single agent", "none"), ("Critic every step", "every"), ("Periodic, $T{=}4$", "periodic-4"), ("Indep.-step DP", f"indep-{star}"),
                ("\\textsc{Belay}", f"static-{star}"), ("\\quad+ re-planning", f"belay-{star}")]

@@ -14,7 +14,7 @@ dependencies = ["numpy>=1.24", "scipy>=1.10", "pyyaml>=6.0"]
 
 [project.optional-dependencies]
 paper = ["matplotlib>=3.7"]
-dev = ["pytest>=7"]
+dev = ["pytest>=7", "ruff>=0.5"]
 
 [project.scripts]
 belay-demo = "belay.demo:main"
@@ -25,3 +25,11 @@ where = ["src"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "W"]
+
+[tool.ruff.lint.per-file-ignores]
+# The report's generator and figure scripts are dense numerical code: compound statements are allowed there,
+# and pyflakes still applies.
+"paper/*" = ["E401", "E701", "E702", "E731", "E741"]

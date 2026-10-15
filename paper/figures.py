@@ -109,7 +109,7 @@ ax.set_title("(a) Success of 13 policies, 4 benchmarks")
 ax = axs[1]
 pol, pred = R["envs"]["retail"]["policies"], R["envs"]["retail"]["pred"]
 ks = np.arange(1, 9)
-for key, col, lab in (("none", C["none"], "Single agent"), (f"static-10", C["belay"], "BELAY plan")):
+for key, col, lab in (("none", C["none"], "Single agent"), ("static-10", C["belay"], "BELAY plan")):
     m = np.array([p[0] for p in pol[key]["pass_k"]]) * 100
     ax.plot(ks, m, "-o", ms=2.2, color=col, label=f"{lab}, measured")
     p1 = pol[key]["success"][0]
